@@ -1,0 +1,90 @@
+import torch
+import torch.nn as nn
+import math
+
+class VectorizedDualEngineProjector(nn.Module):
+    """
+    Fully vectorized Dual-Engine Attention Projector.
+    Zero Python-loop overhead. Compatible with torch.compile.
+    
+    Engine I (Inverse Engine): Top-k boundary pruning via STE.
+    Engine II (Primary Engine): Self-regulating interior floor.
+    """
+    def __init__(
+        self, n_heads, k_default=3, alpha_momentum=0.85, 
+        min_active_tokens=2, collapse_threshold=1.01, 
+        stress_threshold=1.05, eta_scale=None
+    ):
+        super().__init__()
+        self.n_heads = n_heads
+        self.alpha = alpha_momentum
+        self.collapse_threshold = collapse_threshold
+        self.stress_threshold = stress_threshold
+        self.min_active_tokens = max(2, min_active_tokens)
+        self.eta_scale = eta_scale or (1.0 / (8.0 * math.pi ** 2))
+        
+        self.register_buffer('running_k_order', torch.full((1, n_heads, 1, 1), float(k_default)))
+        self.register_buffer('running_d_eff', torch.ones((1, n_heads, 1, 1)))
+        
+    def forward(self, raw_attention_scores, prune_ratio=0.5):
+        B, H, q_len, N = raw_attention_scores.shape
+        dtype = raw_attention_scores.dtype
+        
+        # Engine I: Top-K Boundary Pruning via Straight-Through Estimator (STE)
+        k_keep = max(self.min_active_tokens, int(N * (1.0 - prune_ratio)))
+        _, topk_indices = torch.topk(raw_attention_scores, k_keep, dim=-1)
+        
+        prune_mask = torch.full_like(raw_attention_scores, float('-inf'))
+        prune_mask.scatter_(-1, topk_indices, 0.0)
+        active_probs = torch.softmax(raw_attention_scores + prune_mask, dim=-1)
+        
+        # Engine II: Self-Regulating Interior Floor
+        curr_k = torch.clamp(torch.round(self.running_k_order), 1.0, 3.0)
+        eta = self.eta_scale / (16.0 ** (curr_k - 1.0))
+        eta_prime = eta / (1.0 + float(k_keep) * eta)
+        
+        floored = torch.where(active_probs > 0, torch.clamp(active_probs, min=eta_prime), torch.zeros_like(active_probs))
+        final_probs = floored / floored.sum(dim=-1, keepdim=True)
+        
+        # Autonomic Controller: float32 upcast for numerical stability
+        final_f32 = final_probs.to(torch.float32)
+        safe_f32 = torch.where(final_f32 > 0, final_f32, torch.ones_like(final_f32))
+        entropy_f32 = -torch.sum(final_f32 * torch.log(safe_f32), dim=-1, keepdim=True)
+        d_eff = torch.exp(entropy_f32).to(dtype)
+        
+        d_mean = d_eff.mean(dim=(0, 2), keepdim=True)
+        tgt = torch.where(d_mean < self.collapse_threshold, 1.0, torch.where(d_mean < self.stress_threshold, 2.0, 3.0))
+        
+        self.running_k_order.copy_(self.alpha * self.running_k_order + (1.0 - self.alpha) * tgt)
+        self.running_d_eff.copy_(d_mean)
+        
+        return final_probs
+
+class GeometricAttention(nn.Module):
+    """Drop-in Multi-Head Attention replacement layer with Dual-Engine Projector."""
+    def __init__(self, d_model, n_heads, prune_ratio=0.5, **projector_kwargs):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+        self.prune_ratio = prune_ratio
+        
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+        self.projector = VectorizedDualEngineProjector(n_heads, **projector_kwargs)
+        
+    def forward(self, x, mask=None):
+        B, N, D = x.shape
+        Q = self.W_q(x).view(B, N, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.W_k(x).view(B, N, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.W_v(x).view(B, N, self.n_heads, self.d_k).transpose(1, 2)
+        
+        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+            
+        attn_weights = self.projector(scores, self.prune_ratio)
+        output = (attn_weights @ V).transpose(1, 2).contiguous().view(B, N, D)
+        return self.W_o(output)
